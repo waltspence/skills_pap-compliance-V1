@@ -5,6 +5,16 @@
 **Auth:** AES-CBC encrypted password with time-based key, token-based API
 **Transport:** Python `requests`
 
+> **Reports API supersession (April 2026):** The "report generation permanently broken"
+> statements further down in this doc are **outdated**. The working report endpoint is
+> `POST /api/documents-v1-0-server/reports/generate` — see
+> `references/co_reports_api.md` for the confirmed intel and capture plan. The old
+> `therapyreporttemplates-v1-0-server/reports/generate` path is dead; don't chase it.
+>
+> **When CO "stops connecting":** Run `python scripts/diagnose_co.py`. It walks each
+> step, sweeps the 713s clock offset, probes alternate login paths and header shapes,
+> and saves a shareable capture at `/home/claude/co_diag.json`.
+
 ## Authentication
 
 ### Step 1: Encrypt password
@@ -187,10 +197,11 @@ r = session.post(f"{BASE}/proxy/therapyreporttemplates-v1-0-server/api/v1/report
     }, headers=headers)
 ```
 
-**⚠️ STATUS (March 2026):** Returns 502 Bad Gateway. The `/reports/generate` endpoint
-internally depends on `sapphiregateway-v1-server`, which is broken on Philips' side.
-This is a server-side issue — cannot be fixed from the client. Until Philips resolves
-this, Sleep Trend reports must be pulled manually from careorchestrator.com.
+**⚠️ STATUS (superseded April 2026):** The `therapyreporttemplates-v1-0-server/.../generate`
+endpoint below is the **old** path and returns 502 — chasing it was the original wrong
+turn. The live report-generation path is `POST /api/documents-v1-0-server/reports/generate`.
+See `references/co_reports_api.md` for the confirmed intel, presigned-URL flow, and the
+capture plan for the POST body/headers that are still needed.
 
 ### Presigned S3 URLs (for previously generated reports)
 ```python
@@ -241,6 +252,7 @@ Re-auth silently if session check fails. Force re-auth every 15 minutes as safet
 | `patientgateway-v1-server/patient/{id}` | ✅ | Patient detail |
 | `equipment-v1-0-server/patient/{id}/equipment` | ✅ | Device serial numbers |
 | `therapyreporttemplates-v1-0-server/.../templates` | ✅ | List report templates |
-| `therapyreporttemplates-v1-0-server/.../generate` | ❌ 502 | Depends on broken sapphiregateway |
-| `documents-v1-0-server/reports/presigned` | ✅ | Only if report exists |
+| `therapyreporttemplates-v1-0-server/.../generate` | ❌ 502 | Superseded — use `documents-v1-0-server` (see `co_reports_api.md`) |
+| `documents-v1-0-server/reports/generate` | 🟡 | **Current** report gen path; POST body/headers not yet fully captured |
+| `documents-v1-0-server/reports/presigned` | ✅ | Works when a report already exists for the patient |
 | `sapphiregateway-v1-server/patient/search` | ❌ 500 | **Do NOT use** |

@@ -252,15 +252,25 @@ def auth_co_rh(creds, session_dir=SESSION_DIR):
 
     def _co_login(session, username, password):
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        r = session.post(f"{CO_BASE}/proxy/sapphiregateway-v1-server/authentication/logins", json={
+        url = f"{CO_BASE}/proxy/sapphiregateway-v1-server/authentication/logins"
+        r = session.post(url, json={
             "username": username,
             "encryptedPassword": co_encrypt_password(password),
             "applicationId": "Sapphire",
             "timeStamp": ts,
         }, headers={"Accept": "application/json", "Content-Type": "application/json"}, timeout=30)
-        auth = r.json()
+        # Surface HTTP-level failures with status + body snippet. The old code called
+        # r.json() unconditionally, so a 4xx/5xx non-JSON body surfaced as an unhelpful
+        # JSONDecodeError. If CO migrates the login path or adds an anti-bot check, we
+        # need the status/body to tell — blind retries with a fresh AES key won't help.
+        if r.status_code >= 400:
+            raise ValueError(f"HTTP {r.status_code} at {url} — body[:300]={r.text[:300]!r}")
+        try:
+            auth = r.json()
+        except Exception:
+            raise ValueError(f"Non-JSON {r.status_code} at {url} — body[:300]={r.text[:300]!r}")
         if "token" not in auth:
-            raise ValueError(f"No token: {json.dumps(auth)[:200]}")
+            raise ValueError(f"No token (HTTP {r.status_code}): {json.dumps(auth)[:300]}")
         headers = {"Accept": "application/json", "Content-Type": "application/json",
                    "auth_token": json.dumps(auth["token"])}
         return auth, headers, auth.get("userTopOrgId")

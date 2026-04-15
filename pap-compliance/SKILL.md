@@ -234,6 +234,7 @@ The user can open the ZIP themselves — do not recap its contents in prose.
 - `scripts/search_all.py` — Search 3 portals with inline DOB verify, chunked
 - `scripts/download_reports.py` — Download PDFs, chunked, checkpoint-on-expiry
 - `scripts/gen_spreadsheet.py` — Spreadsheet + log + ZIP
+- `scripts/diagnose_co.py` — CO connectivity probe. Run this when `auth_co_rh.py` prints `❌ Failed after 3 attempts` — it walks each hop verbosely, sweeps the 713s clock offset, probes alternate login paths + header shapes, and dumps a shareable capture to `/home/claude/co_diag.json`.
 
 ## Known Issues (April 2026)
 
