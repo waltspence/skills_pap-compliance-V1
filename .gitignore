@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Local test artifacts (sandbox paths the skill writes to at runtime)
+/home/claude/
+co_diag.json
