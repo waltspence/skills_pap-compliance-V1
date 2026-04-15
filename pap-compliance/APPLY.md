@@ -75,6 +75,13 @@ reports API moved to `documents-v1-0-server` is still real, but unrelated to thi
 - `_co_login` now raises `ValueError("HTTP {status} at {url} — body[:300]={…}")` on
   4xx/5xx or non-JSON bodies instead of letting `r.json()` throw a JSONDecodeError.
   Makes retry-loop failure messages tell you the real problem next time.
+- `auth_co_rh` retry loop now fails fast on `NameError`, `AttributeError`, `TypeError`,
+  `KeyError`, `ImportError` — these are coding/config bugs that can't succeed on
+  retry, so retrying wastes ~9s and hides the real exception type. The error message
+  also now includes the exception class name (`ValueError: ...`, `NameError: ...`)
+  so the bug class is visible at a glance instead of buried in a generic wrapper.
+  Verified: injected NameError fails in 0.13s with "Failed after 1 attempt:
+  NameError: ... (client-side bug, not retried)".
 - Added `scripts/diagnose_co.py` — a verbose probe that walks each CO step, sweeps
   `CO_CLOCK_OFFSET`, tries alternate login paths and header shapes, and dumps a
   shareable capture at `/home/claude/co_diag.json`. See the SKILL.md scripts list.

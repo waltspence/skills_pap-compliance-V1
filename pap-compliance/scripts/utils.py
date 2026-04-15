@@ -277,9 +277,17 @@ def auth_co_rh(creds, session_dir=SESSION_DIR):
         return auth, headers, auth.get("userTopOrgId")
 
     # CO
+    # Exception types that indicate a coding/config bug, not a transient backend
+    # failure. Retrying these is pure waste — they cannot succeed on attempt 2 or 3.
+    # Keeping the original exception type in the message also makes the bug class
+    # obvious instead of hiding behind a generic "Failed after 3 attempts" wrapper.
+    NON_RETRYABLE = (NameError, AttributeError, TypeError, KeyError, ImportError)
+
     try:
         last_error = None
+        attempts_made = 0
         for attempt in range(1, CO_MAX_RETRIES + 1):
+            attempts_made = attempt
             try:
                 co_session = new_session()
                 co_auth, co_headers, co_org_id = _co_login(
@@ -297,14 +305,19 @@ def auth_co_rh(creds, session_dir=SESSION_DIR):
                 results["CO"] = f"✅ Authenticated{note}"
                 last_error = None
                 break
+            except NON_RETRYABLE as e:
+                # Client-side bug — fail fast, surface the type.
+                last_error = f"{type(e).__name__}: {e} (client-side bug, not retried)"
+                break
             except Exception as e:
-                last_error = str(e)
+                last_error = f"{type(e).__name__}: {e}"
                 if attempt < CO_MAX_RETRIES:
                     time.sleep(CO_RETRY_DELAY)
         if last_error:
-            results["CO"] = f"❌ Failed after {CO_MAX_RETRIES} attempts: {last_error}"
+            n = "attempt" if attempts_made == 1 else "attempts"
+            results["CO"] = f"❌ Failed after {attempts_made} {n}: {last_error}"
     except Exception as e:
-        results["CO"] = f"❌ {e}"
+        results["CO"] = f"❌ {type(e).__name__}: {e}"
 
     # RH
     try:
