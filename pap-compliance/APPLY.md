@@ -53,6 +53,35 @@ python -c "import ast; [ast.parse(open(f).read()) for f in ['scripts/search_all.
 python scripts/auth_co_rh.py   # should print CO ✅, RH ✅ (no pip install noise)
 ```
 
+## CO-connect root cause (April 2026, live test on repo landing)
+
+Ran `python scripts/auth_co_rh.py` with stub creds. It failed with:
+`❌ Failed after 3 attempts: name 'os' is not defined`.
+
+Cause: the S1 patch to `utils.co_secret_key()` added `os.environ.get("CO_CLOCK_OFFSET", "713")`
+but `utils.py` does not `import os` at the top — every other `os` use in the file is
+aliased inline as `_os` for session dir handling. `co_secret_key()` runs on every CO
+login attempt (and therefore every session-health check), so every CO connect has been
+dying at the key-derivation step before any network call is made.
+
+The symptom — "CO stopped connecting" across 3 retries with no HTTP status printed —
+looks identical to a backend change. Nothing on Philips' side actually moved for auth;
+this is a client-side regression from the R6/S1 patch. The S5-era doc note that
+reports API moved to `documents-v1-0-server` is still real, but unrelated to this bug.
+
+**Fix:** `import os` added at top of `utils.py`.
+
+**Also applied in the same pass (defense in depth):**
+- `_co_login` now raises `ValueError("HTTP {status} at {url} — body[:300]={…}")` on
+  4xx/5xx or non-JSON bodies instead of letting `r.json()` throw a JSONDecodeError.
+  Makes retry-loop failure messages tell you the real problem next time.
+- Added `scripts/diagnose_co.py` — a verbose probe that walks each CO step, sweeps
+  `CO_CLOCK_OFFSET`, tries alternate login paths and header shapes, and dumps a
+  shareable capture at `/home/claude/co_diag.json`. See the SKILL.md scripts list.
+- `references/care_orchestrator.md` reconciled with `co_reports_api.md`: the old
+  "reports gen permanently broken" language was a wrong turn; the live path is
+  `POST /api/documents-v1-0-server/reports/generate`.
+
 ## Follow-up cleanup (April 2026, repo landing)
 
 Applied on top of the v3 patch above while moving the skill into version control:
