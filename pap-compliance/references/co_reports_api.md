@@ -1,9 +1,15 @@
 # Care Orchestrator Reports API — Intel & Capture Plan
 
-Status: **partially reverse-engineered**. Report generation is NOT permanently broken.
-Earlier "502s" came from hitting the wrong service (sapphiregateway). The real service
-is `documents-v1-0-server`. This file tracks what's confirmed, what's still needed, and
-how to capture the rest.
+Status: **partially reverse-engineered, not yet automated.** Report generation is NOT
+permanently broken. Earlier "502s" came from hitting the wrong service
+(`sapphiregateway`). The real service is `documents-v1-0-server`. This file tracks
+what's confirmed, what's still needed, and how to capture the rest.
+
+**Canonical target report: Sleep Trend.** Template id
+`ebedbf1a-be12-4756-9661-85dc7bec1792` (per the templates list in
+`references/care_orchestrator.md`). Use **Trilogy Detail** only for ventilator
+patients. "Compliance Report" appears in the UI dropdown and in earlier notes, but
+Sleep Trend is the per-site standing SOP — generate that one.
 
 ## Confirmed (from 2026-04 browser session on patient Stephen Moore)
 
@@ -30,8 +36,12 @@ and required headers are NOT yet captured (see capture plan below).
 - Compliance Summary
 - Trilogy Detail (ventilator patients)
 
-Default template for CPAP/BiPAP compliance pulls = **Compliance Report**. Use
-**Trilogy Detail** only when the patient is on a Trilogy vent.
+The UI dropdown labels don't match the templates API 1:1 — the templates list in
+`care_orchestrator.md` returns `Trend (Sleep Trend)`, `ComplianceSummary`, `Detail`,
+`Summary`, `Patient`. **Our standing target is Sleep Trend** (API template id
+`ebedbf1a-be12-4756-9661-85dc7bec1792`). When capturing the `reports/generate` POST,
+generate the **Sleep Trend** report, not Compliance Report, so the body we record is
+the right one. Use **Trilogy Detail** only for Trilogy vent patients.
 
 **Default timeframe:** UI pre-populates 30 days. Match our standard (30 day, and a
 90-day if patient has ≥90 days data — same rule as AirView).
@@ -85,7 +95,9 @@ app. So capture must happen on Walt's actual workstation:
    })();
    ```
 4. Network tab → filter `reports` → Clear.
-5. In the UI: template = "Compliance Report", range = 30 days, click **Create report**.
+5. In the UI: template = **Sleep Trend** (the Philips dropdown may label it "Trend" or
+   "Sleep Trend"), range = 30 days, click **Create report**. DO NOT pick "Compliance
+   Report" — the captured body will be for the wrong template and won't help us.
 6. In Network: right-click the `/reports/generate` POST → Copy → Copy as cURL (bash).
    Do the same for any follow-up call (status poll, presigned URL fetch).
 7. Console: `copy(JSON.stringify(window.__cap, null, 2))` → paste into a new chat as

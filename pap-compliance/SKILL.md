@@ -67,8 +67,14 @@ resume instructions. They do NOT auto-retrigger MFA — the user re-auths betwee
 | Platform | Manufacturer | Report | Endpoint Status |
 |---|---|---|---|
 | AirView | ResMed | Compliance and Therapy | ✅ Full pipeline |
-| Care Orchestrator | Philips | Compliance / Trilogy Detail | ✅ Search, ⚠️ Report gen (see references/co_reports_api.md) |
+| Care Orchestrator | Philips | **Sleep Trend** (Trilogy Detail for vent patients) | ✅ Search, ❌ Report gen pending capture (see `references/co_reports_api.md`) |
 | React Health | 3B | Compliance and Therapy | ✅ Auth/search, PDF needs work |
+
+**CO report type:** The canonical CO pull is the **Sleep Trend** report
+(template id `ebedbf1a-be12-4756-9661-85dc7bec1792`). Use **Trilogy Detail**
+only for ventilator patients. Do NOT default to "Compliance Report" — that
+was a UI-dropdown label seen during reverse engineering; our standing target
+is Sleep Trend.
 
 ## Two Workflow Modes
 
@@ -178,6 +184,19 @@ Downloads 30-day (all) + 90-day (when ≥90 days available) from AirView.
 Session check every 5 patients. On expiry: checkpoint + `sys.exit(2)` with resume steps.
 
 Output: PDFs in `/home/claude/reports/` + `download_log.json`.
+
+**CO report generation — NOT YET AUTOMATED.** `download_reports.py` pulls AirView
+PDFs only. For Care Orchestrator patients the flow is:
+
+1. Mark the patient as "CO manual pull" in the review queue (Phase 3.5).
+2. Tell the user they need to pull the **Sleep Trend** report (template id
+   `ebedbf1a-be12-4756-9661-85dc7bec1792`, "Trilogy Detail" for vent patients)
+   manually from `https://www.careorchestrator.com/#/patient/{patientUuid}/therapydata/reports`.
+3. Skip CO for that patient in the spreadsheet — the row will show as "manual pull".
+
+To get CO automated, capture the `POST /api/documents-v1-0-server/reports/generate`
+body + headers per `references/co_reports_api.md`. The capture plan specifies
+**Sleep Trend** (not Compliance Report) so the recorded body matches our target.
 
 ### Phase 5 — Spreadsheet + ZIP
 ```bash
