@@ -67,7 +67,7 @@ resume instructions. They do NOT auto-retrigger MFA — the user re-auths betwee
 | Platform | Manufacturer | Report | Endpoint Status |
 |---|---|---|---|
 | AirView | ResMed | Compliance and Therapy | ✅ Full pipeline |
-| Care Orchestrator | Philips | **Sleep Trend** (Trilogy Detail for vent patients) | ✅ Search, ❌ Report gen blocked on HAR capture (see `references/co_reports_api.md`) |
+| Care Orchestrator | Philips | **Compliance Report** (pre-generated) | ✅ Full pipeline (list + presigned S3 fetch) |
 | React Health | 3B | Compliance and Therapy | ✅ Auth/search, PDF needs work |
 
 **CO report type:** The canonical CO pull is the **Sleep Trend** report
@@ -185,26 +185,25 @@ Session check every 5 patients. On expiry: checkpoint + `sys.exit(2)` with resum
 
 Output: PDFs in `/home/claude/reports/` + `download_log.json`.
 
-**CO Sleep Trend download — first automated attempt.** After the AV pass,
-`download_reports.py` runs a CO pass for every CO-DOB-verified patient:
+**CO report download — confirmed working (3 GETs, no POST).**
+CO compliance reports are **pre-generated** by backend batch jobs. The client
+lists existing documents and fetches PDFs via presigned S3 URLs:
 
-1. Resolve the patient's primary device serial via
-   `GET /proxy/equipment-v1-0-server/patient/{uuid}/equipment`.
-2. POST the Sleep Trend body to both route variants of
-   `documents-v1-0-server/reports/generate` (see `references/co_reports_api.md`).
-3. On a direct PDF response, save it. On a JSON response with `presignedUrl` or
-   `documentId`, follow up and save the PDF. On any failure, append the full
-   response (status + headers + body[:500]) to `/home/claude/co_generate_capture.json`.
+1. `GET /proxy/documents-v1-0-server/patients/{uuid}` → list all documents.
+   Filter by: `documentStatus == "Complete"`, `placeholder == false`,
+   `title` matching "Compliance Report" / "Sleep Trend" / etc.
+2. `GET /proxy/documents-v1-0-server/patients/{uuid}/document/{docId}/presigned`
+   → `{"presignedUrl": "https://cf-s3-....s3-external-1.amazonaws.com/..."}`.
+3. `GET {presignedUrl}` (no auth needed — AWS query params are the credential)
+   → raw PDF bytes.
 
-The POST body is a best guess extrapolated from the old therapyreporttemplates
-body shape — if the server rejects a field, the capture file tells you exactly
-which one, and the next code iteration is narrow. Until the first live run lands,
-treat CO output as experimental and audit the capture file after every run.
+**Date format warning:** CO document `startDate`/`endDate` fields use two
+inconsistent formats — ISO `"2026-01-28"` for system-generated docs and
+JavaScript `Date.toString()` for user-generated docs. Both must be parsed.
 
-If CO fails for a patient, the spreadsheet row shows the failure and the user
-can still pull the **Sleep Trend** report (template id
-`ebedbf1a-be12-4756-9661-85dc7bec1792`, or "Trilogy Detail" for vent patients)
-manually from `https://www.careorchestrator.com/#/patient/{patientUuid}/therapydata/reports`.
+If a patient has no matching documents, report "no compliance report available
+for this period" — do NOT try to generate one. The `/reports/generate` endpoint
+is internal batch infrastructure and rejects all external requests.
 
 ### Phase 5 — Spreadsheet + ZIP
 ```bash

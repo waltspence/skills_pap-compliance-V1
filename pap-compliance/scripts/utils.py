@@ -65,6 +65,31 @@ def normalize_dob(dob_str):
     return None
 
 
+def parse_co_date(date_str):
+    """
+    Parse CO document dates which come in two inconsistent formats:
+      - "2026-01-28" (ISO, from system-generated docs)
+      - "Sat Jan 03 2026 01:00:00 GMT-0500 (Eastern Standard Time)" (JS toString, from user-generated docs)
+    Returns a date object or None.
+    """
+    if not date_str or not isinstance(date_str, str):
+        return None
+    s = date_str.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except (ValueError, AttributeError):
+            continue
+    # JS Date.toString(): "Sat Jan 03 2026 01:00:00 GMT-0500 (Eastern Standard Time)"
+    m = re.match(r'\w{3}\s+(\w{3})\s+(\d{1,2})\s+(\d{4})', s)
+    if m:
+        try:
+            return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%b %d %Y").date()
+        except (ValueError, AttributeError):
+            pass
+    return None
+
+
 def dob_matches(profile_dob_str, schedule_dob_str):
     """Compare two DOB strings, return True if they represent the same date."""
     pd = normalize_dob(profile_dob_str)
@@ -273,27 +298,44 @@ def co_list_documents(co_session, co_headers, patient_uuid):
 def co_fetch_document(co_session, co_headers, patient_uuid, document_id,
                       out_path):
     """
-    Fetch a specific document (PDF) by document ID.
-    Returns {"status": "OK", "file": ..., "size": ...} or {"status": "FAIL", ...}.
+    Fetch a PDF via presigned S3 URL. Two GETs:
+    1. GET /patients/{uuid}/document/{docId}/presigned → {"presignedUrl": "..."}
+    2. GET {presignedUrl} (no auth needed — AWS query params are the credential)
     """
-    url = (f"{CO_BASE}/proxy/documents-v1-0-server/patients/"
-           f"{patient_uuid}/document/{document_id}")
+    presigned_url_endpoint = (
+        f"{CO_BASE}/proxy/documents-v1-0-server/patients/"
+        f"{patient_uuid}/document/{document_id}/presigned")
     try:
-        r = co_session.get(url, headers=co_headers, timeout=60)
+        r = co_session.get(presigned_url_endpoint, headers=co_headers, timeout=30)
     except Exception as e:
         return {"status": "ERROR", "error": f"{type(e).__name__}: {e}"}
-    if r.status_code == 200 and len(r.content) > 0:
-        import os as _os
-        _os.makedirs(_os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "wb") as f:
-            f.write(r.content)
-        is_pdf = r.content[:5] == b"%PDF-"
-        return {"status": "OK", "file": out_path, "size": len(r.content),
-                "is_pdf": is_pdf,
-                "content_type": r.headers.get("Content-Type")}
-    return {"status": "FAIL", "http_status": r.status_code,
-            "size": len(r.content),
-            "body_snippet": r.text[:200]}
+    if r.status_code != 200:
+        return {"status": "FAIL", "http_status": r.status_code,
+                "body_snippet": r.text[:200]}
+    try:
+        presigned_url = r.json().get("presignedUrl")
+    except Exception:
+        return {"status": "FAIL", "error": "non-JSON presigned response",
+                "body_snippet": r.text[:200]}
+    if not presigned_url:
+        return {"status": "FAIL", "error": "no presignedUrl in response",
+                "body_snippet": r.text[:200]}
+
+    try:
+        pr = co_session.get(presigned_url, timeout=60)
+    except Exception as e:
+        return {"status": "ERROR", "error": f"S3 fetch: {type(e).__name__}: {e}"}
+    if pr.status_code != 200 or len(pr.content) == 0:
+        return {"status": "FAIL", "http_status": pr.status_code,
+                "size": len(pr.content)}
+
+    import os as _os
+    _os.makedirs(_os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "wb") as f:
+        f.write(pr.content)
+    return {"status": "OK", "file": out_path, "size": len(pr.content),
+            "is_pdf": pr.content[:5] == b"%PDF-",
+            "content_type": pr.headers.get("Content-Type")}
 
 
 def download_co_reports(co_session, co_headers, patient_uuid, patient_name,
@@ -321,12 +363,16 @@ def download_co_reports(co_session, co_headers, patient_uuid, patient_name,
     if not docs:
         return {"status": "NO_REPORTS", "info": info}
 
-    # Filter for matching document types
     matched = []
     for doc in docs:
-        doc_name = str(doc.get("name", doc.get("reportName", doc.get("fileName", "")))).lower()
-        doc_type = str(doc.get("type", doc.get("reportType", doc.get("templateClass", "")))).lower()
-        doc_id = doc.get("documentId", doc.get("id", doc.get("objectId")))
+        doc_name = str(doc.get("title", doc.get("name", doc.get("originalFileName", "")))).lower()
+        doc_type = str(doc.get("documentType", "")).lower()
+        doc_id = doc.get("documentId")
+        doc_status = doc.get("documentStatus", "")
+        placeholder = doc.get("placeholder", False)
+
+        if doc_status != "Complete" or placeholder:
+            continue
 
         is_match = any(t in doc_name or t in doc_type for t in target_types)
         if is_match and doc_id:
