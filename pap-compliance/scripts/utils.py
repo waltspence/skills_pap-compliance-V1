@@ -99,32 +99,53 @@ def dob_matches(profile_dob_str, schedule_dob_str):
     return False
 
 
-def extract_dob_from_profile(session, ecn):
-    """Fetch AirView patient profile and extract DOB."""
+def extract_dob_and_serial_from_profile(session, ecn):
+    """Fetch AirView patient profile page and extract DOB + serial. Single HTTP fetch."""
     try:
         r = session.get(f"https://airview.resmed.com/patients/{ecn}", timeout=30)
         if "sign-in-widget" in r.text:
-            return None  # session expired
+            return None, None
 
-        # Try JSON embedded data
-        m = re.search(r'"dateOfBirth"\s*:\s*"([^"]+)"', r.text)
+        html = r.text
+        dob = None
+        serial = None
+
+        # DOB extraction
+        m = re.search(r'"dateOfBirth"\s*:\s*"([^"]+)"', html)
         if m:
-            return m.group(1)
+            dob = m.group(1)
+        if not dob:
+            m = re.search(r'(?:Date of Birth|DOB)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', html, re.IGNORECASE)
+            if m:
+                dob = m.group(1)
+        if not dob:
+            soup = BeautifulSoup(html, "html.parser")
+            for text in soup.stripped_strings:
+                if re.match(r'\d{1,2}/\d{1,2}/\d{4}$', text.strip()):
+                    dob = text.strip()
+                    break
+        if not dob:
+            dob = "NOT_FOUND"
 
-        # Try visible text patterns
-        m = re.search(r'(?:Date of Birth|DOB)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', r.text, re.IGNORECASE)
-        if m:
-            return m.group(1)
+        # Serial extraction — try JSON fields then visible text
+        for pat in [r'"serialNumber"\s*:\s*"([^"]+)"',
+                    r'"deviceSerialNumber"\s*:\s*"([^"]+)"',
+                    r'"serial"\s*:\s*"([^"]+)"',
+                    r'(?:Serial\s*(?:Number|#)?|S/N)[:\s]+([A-Z0-9][A-Z0-9\-]{6,})']:
+            m = re.search(pat, html)
+            if m:
+                serial = m.group(1)
+                break
 
-        # Try bare date in stripped strings
-        soup = BeautifulSoup(r.text, "html.parser")
-        for text in soup.stripped_strings:
-            if re.match(r'\d{1,2}/\d{1,2}/\d{4}$', text.strip()):
-                return text.strip()
-
-        return "NOT_FOUND"
+        return dob, serial
     except Exception as e:
-        return f"ERROR:{e}"
+        return f"ERROR:{e}", None
+
+
+def extract_dob_from_profile(session, ecn):
+    """Backward-compatible wrapper — returns DOB string only."""
+    dob, _ = extract_dob_and_serial_from_profile(session, ecn)
+    return dob
 
 
 # ═══════════════════════════════════════════════════

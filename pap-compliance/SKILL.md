@@ -214,10 +214,27 @@ With `--zip`: creates the final archive in `/mnt/user-data/outputs/`.
 
 **Output contract — the final ZIP contains:**
 - `PAP_Compliance_{YYYY-MM-DD}.xlsx` — summary + per-day tabs
-- `reports/*.pdf` — all downloaded compliance PDFs (from `/home/claude/reports/`)
+- `*.pdf` — all downloaded compliance PDFs (flat-packed next to the xlsx so
+  relative hyperlinks in the 30-day / 90-day cells resolve after extraction)
 - `run_log.json` — per-patient outcomes (queued, skipped, found, downloaded, errors)
 - `download_log.json` — raw download results with HTTP codes and sizes
 - `search_results.json` — merged search results across all chunks
+
+**Spreadsheet columns (Summary tab):**
+`Patient | MRN | DOB | Visit Date | Provider | Portal | Serial | Status | 30-day | 90-day | Notes`
+
+Per-day tabs: same, minus `Visit Date`.
+
+- **MRN** — from the schedule parse. Always populated.
+- **Portal** — `AV`, `CO`, or `RH` — the primary DOB-verified portal for this patient.
+  Empty if no portal matched.
+- **Serial** — device serial number from the matched portal. Captured during search
+  (not download), so it's populated even for patients that weren't downloaded.
+  AV serial comes from the profile page HTML; CO from the equipment endpoint;
+  RH from the cached patient list.
+- **30-day / 90-day** — clickable relative hyperlinks to the PDF files. PDFs and the
+  xlsx are flat-packed in the same ZIP folder, so `cell.hyperlink = filename` resolves.
+  Empty cells when no report for that period.
 
 Final ZIP path: `/mnt/user-data/outputs/PAP_Compliance_{YYYY-MM-DD}.zip`
 

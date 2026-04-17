@@ -19,9 +19,9 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
 from utils import (
-    name_match, dob_matches, extract_dob_from_profile, recency_score,
+    name_match, dob_matches, extract_dob_and_serial_from_profile, recency_score,
     is_stale, is_over_year, parse_avail_days, check_av_session,
-    SESSION_DIR, new_session
+    co_get_equipment_serial, SESSION_DIR, new_session
 )
 from bs4 import BeautifulSoup
 
@@ -94,9 +94,9 @@ def search_airview(av_session, last, first, schedule_dob):
             verified.append(p)
             continue
 
-        # Verify DOB
-        profile_dob = extract_dob_from_profile(av_session, p["ecn"])
+        profile_dob, profile_serial = extract_dob_and_serial_from_profile(av_session, p["ecn"])
         p["profile_dob"] = profile_dob or ""
+        p["serial"] = profile_serial or ""
         time.sleep(0.3)
 
         if profile_dob and dob_matches(profile_dob, schedule_dob):
@@ -153,7 +153,14 @@ def search_co(co_session, co_headers, last, first, schedule_dob):
                 "portal": "CO",
             })
 
-        return {"status": "ok", "matches": [m for m in matches if m["dob_verified"]]}
+        verified = [m for m in matches if m["dob_verified"]]
+        for m in verified:
+            try:
+                serial, _ = co_get_equipment_serial(co_session, co_headers, m["patientId"])
+                m["serial"] = serial or ""
+            except Exception:
+                m["serial"] = ""
+        return {"status": "ok", "matches": verified}
     except Exception as e:
         return {"status": f"error:{e}", "matches": []}
 
