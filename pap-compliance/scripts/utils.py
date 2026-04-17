@@ -217,12 +217,9 @@ CO_TEMPLATES = {
     "patient":        "ecd5601b-03c1-4127-b0f6-60bc877ea413",
 }
 
-# Route variants we try. `/api/...` is the path confirmed in co_reports_api.md
-# (April 2026 capture). `/proxy/...` is the pattern used elsewhere in the skill
-# for other microservices; kept as a fallback since the service naming scheme
-# suggests it should also be reachable that way. Both land on documents-v1-0-server.
+# Confirmed live April 2026: /api/ returns 404 "Cannot POST"; /proxy/ returns 400
+# (route alive, body rejected). Only /proxy/ is a real route.
 CO_REPORT_ROUTES = [
-    "/api/documents-v1-0-server/reports/generate",
     "/proxy/documents-v1-0-server/reports/generate",
 ]
 
@@ -252,25 +249,55 @@ def co_get_equipment_serial(co_session, co_headers, patient_uuid):
     return serial, primary
 
 
-def _co_generate_body(patient_uuid, serial, start_date, end_date, days,
-                      template_id, file_name):
+def _co_generate_body_variants(patient_uuid, serial, start_date, end_date, days,
+                               template_id, file_name):
     """
-    Best-guess POST body for documents-v1-0-server/reports/generate. Shaped after
-    the therapyreporttemplates body that was documented in care_orchestrator.md —
-    same field names are a reasonable starting point since the templates library
-    is shared. If the server rejects a field, the error body + the capture file
-    will tell us which one so the next iteration is narrow.
+    The live CO backend returns 400 with an empty body (no field-level error) when
+    the POST shape is wrong. Since we can't iterate on error messages, we try
+    multiple body variants in order from most-likely to least-likely.
+
+    Variant A: full body (old therapyreporttemplates shape)
+    Variant B: without serial (some patients have none; maybe optional)
+    Variant C: minimal — just template + patient + dates
+    Variant D: camelCase alternatives (patientUuid instead of patientId)
+    Variant E: with reportType field (some APIs use this instead of templateId)
     """
-    return {
-        "templateId": template_id,
-        "patientId": patient_uuid,
-        "deviceSerialNumber": serial,
-        "startDate": start_date,
-        "endDate": end_date,
-        "fileName": file_name,
-        "reportComplianceByBlowerTime": False,
-        "bestNumberOfDays": days,
-    }
+    base = {"templateId": template_id, "patientId": patient_uuid,
+            "startDate": start_date, "endDate": end_date}
+    variants = []
+
+    # A: full body with serial
+    if serial:
+        variants.append(("full", {**base, "deviceSerialNumber": serial,
+                                   "fileName": file_name,
+                                   "reportComplianceByBlowerTime": False,
+                                   "bestNumberOfDays": days}))
+
+    # B: no serial, no optional fields
+    variants.append(("no_serial", {**base, "fileName": file_name}))
+
+    # C: bare minimum
+    variants.append(("minimal", {**base}))
+
+    # D: camelCase alternative field names
+    alt = {"templateId": template_id, "patientUuid": patient_uuid,
+           "startDate": start_date, "endDate": end_date}
+    if serial:
+        alt["serialNumber"] = serial
+    variants.append(("alt_fields", alt))
+
+    # E: reportType instead of templateId
+    variants.append(("report_type", {"reportType": "trend", "patientId": patient_uuid,
+                                      "startDate": start_date, "endDate": end_date,
+                                      "bestNumberOfDays": days}))
+
+    # F: with serial as nested object
+    if serial:
+        variants.append(("nested_device", {**base,
+                                            "device": {"serialNumber": serial},
+                                            "fileName": file_name}))
+
+    return variants
 
 
 def download_co_sleep_trend(co_session, co_headers, patient_uuid, serial,
@@ -310,13 +337,16 @@ def download_co_sleep_trend(co_session, co_headers, patient_uuid, serial,
     start_date = start_dt.strftime("%Y-%m-%d")
     end_date = end_dt.strftime("%Y-%m-%d")
     file_name = f"SleepTrend_{end_date}.pdf"
-    body = _co_generate_body(patient_uuid, serial, start_date, end_date, days,
-                             template_id, file_name)
+
+    body_variants = _co_generate_body_variants(
+        patient_uuid, serial, start_date, end_date, days, template_id, file_name)
 
     captures = []
-    for route in CO_REPORT_ROUTES:
-        url = f"{CO_BASE}{route}"
-        attempt = {"url": url, "body": body, "ts": _dt.utcnow().isoformat()}
+    url = f"{CO_BASE}{CO_REPORT_ROUTES[0]}"
+
+    for variant_name, body in body_variants:
+        attempt = {"url": url, "variant": variant_name, "body": body,
+                   "ts": _dt.utcnow().isoformat()}
         try:
             r = co_session.post(url, json=body, headers=co_headers, timeout=60)
         except Exception as e:
@@ -335,7 +365,7 @@ def download_co_sleep_trend(co_session, co_headers, patient_uuid, serial,
                                                   "www-authenticate")},
         })
 
-        # Case A: direct PDF
+        # Direct PDF
         if r.status_code == 200 and r.content[:5] == b"%PDF-":
             out = _os.path.join(reports_dir, f"{patient_uuid}_sleep_trend.pdf")
             with open(out, "wb") as f:
@@ -344,9 +374,22 @@ def download_co_sleep_trend(co_session, co_headers, patient_uuid, serial,
             captures.append(attempt)
             _write_capture(capture_dir, patient_uuid, captures)
             return {"status": "OK", "file": out, "size": len(r.content),
-                    "route": route, "method": "direct_pdf"}
+                    "variant": variant_name, "method": "direct_pdf"}
 
-        # Case B: JSON response — may contain presigned URL or documentId
+        # Non-empty 200 with octet-stream — might be PDF without magic bytes or
+        # a binary blob we should save for inspection
+        if r.status_code == 200 and len(r.content) > 0:
+            out = _os.path.join(reports_dir, f"{patient_uuid}_sleep_trend_raw.bin")
+            with open(out, "wb") as f:
+                f.write(r.content)
+            attempt["result"] = "binary_200"
+            attempt["saved_to"] = out
+            captures.append(attempt)
+            _write_capture(capture_dir, patient_uuid, captures)
+            return {"status": "OK_BINARY", "file": out, "size": len(r.content),
+                    "variant": variant_name, "method": "binary_200"}
+
+        # JSON response — may contain presigned URL or documentId
         if r.status_code < 400 and "json" in ctype.lower():
             try:
                 js = r.json()
@@ -362,25 +405,25 @@ def download_co_sleep_trend(co_session, co_headers, patient_uuid, serial,
                 doc_id = (js.get("documentId") or js.get("id")
                           or js.get("reportId") or js.get("objectId"))
 
-            # Try presigned URL directly
             if presigned:
                 try:
                     pr = co_session.get(presigned, timeout=60)
                     if pr.status_code == 200 and pr.content[:5] == b"%PDF-":
-                        out = _os.path.join(reports_dir, f"{patient_uuid}_sleep_trend.pdf")
+                        out = _os.path.join(reports_dir,
+                                            f"{patient_uuid}_sleep_trend.pdf")
                         with open(out, "wb") as f:
                             f.write(pr.content)
                         attempt["result"] = "presigned_pdf"
                         captures.append(attempt)
                         _write_capture(capture_dir, patient_uuid, captures)
-                        return {"status": "OK", "file": out, "size": len(pr.content),
-                                "route": route, "method": "presigned"}
+                        return {"status": "OK", "file": out,
+                                "size": len(pr.content),
+                                "variant": variant_name, "method": "presigned"}
                     attempt["presigned_status"] = pr.status_code
                     attempt["presigned_body_snippet"] = pr.text[:200]
                 except Exception as e:
                     attempt["presigned_error"] = f"{type(e).__name__}: {e}"
 
-            # Try presigned lookup by documentId
             if doc_id and not presigned:
                 look = f"{CO_BASE}/proxy/documents-v1-0-server/reports/presigned"
                 try:
@@ -389,14 +432,18 @@ def download_co_sleep_trend(co_session, co_headers, patient_uuid, serial,
                                         headers=co_headers, timeout=30)
                     attempt["presigned_lookup_status"] = lr.status_code
                     attempt["presigned_lookup_body"] = lr.text[:300]
-                    if lr.status_code == 200 and "json" in lr.headers.get("Content-Type", ""):
-                        lj = lr.json()
-                        ps = lj.get("presignedUrl") or lj.get("url")
+                    if lr.status_code == 200:
+                        try:
+                            lj = lr.json()
+                            ps = lj.get("presignedUrl") or lj.get("url")
+                        except Exception:
+                            ps = None
                         if ps:
                             pr = co_session.get(ps, timeout=60)
                             if pr.status_code == 200 and pr.content[:5] == b"%PDF-":
-                                out = _os.path.join(reports_dir,
-                                                    f"{patient_uuid}_sleep_trend.pdf")
+                                out = _os.path.join(
+                                    reports_dir,
+                                    f"{patient_uuid}_sleep_trend.pdf")
                                 with open(out, "wb") as f:
                                     f.write(pr.content)
                                 attempt["result"] = "docid_presigned_pdf"
@@ -404,26 +451,27 @@ def download_co_sleep_trend(co_session, co_headers, patient_uuid, serial,
                                 _write_capture(capture_dir, patient_uuid, captures)
                                 return {"status": "OK", "file": out,
                                         "size": len(pr.content),
-                                        "route": route, "method": "docid_presigned"}
+                                        "variant": variant_name,
+                                        "method": "docid_presigned"}
                 except Exception as e:
                     attempt["presigned_lookup_error"] = f"{type(e).__name__}: {e}"
 
-            # JSON response with no clear presigned / docId path
             attempt["result"] = "json_no_pdf"
             captures.append(attempt)
             continue
 
-        # Case C: error status or unexpected content
+        # Error or unexpected — log and try next variant
         attempt["body_snippet"] = r.text[:500]
+        attempt["body_hex"] = r.content[:50].hex() if r.content else ""
         attempt["result"] = f"http_{r.status_code}"
         captures.append(attempt)
 
     _write_capture(capture_dir, patient_uuid, captures)
     return {"status": "FAIL",
-            "error": "All CO report routes exhausted — see capture file",
+            "error": "All body variants returned errors — see capture file",
             "capture_file": _os.path.join(capture_dir, "co_generate_capture.json"),
             "attempts": len(captures),
-            "routes_tried": [c.get("url") for c in captures]}
+            "variants_tried": [c.get("variant") for c in captures]}
 
 
 def _write_capture(capture_dir, patient_uuid, captures):

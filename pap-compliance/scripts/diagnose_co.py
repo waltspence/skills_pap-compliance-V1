@@ -32,7 +32,7 @@ import os
 import json
 import time
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 from utils import (
@@ -327,31 +327,40 @@ def main():
                                   "error": None if serial else eq_info.get("error"),
                                   "body_snippet": None if serial else eq_info.get("body_snippet")})
 
-    gen_body = {
-        "templateId": CO_TEMPLATES["sleep_trend"],
-        "patientId": probe_uuid,
-        "deviceSerialNumber": serial or "UNKNOWN",
-        "startDate": "2026-03-18",
-        "endDate": "2026-04-17",
-        "fileName": "SleepTrend_probe.pdf",
-        "reportComplianceByBlowerTime": False,
-        "bestNumberOfDays": 30,
-    }
-    for idx, route in enumerate(CO_REPORT_ROUTES, start=1):
+    from utils import _co_generate_body_variants
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=30)
+    start_date = start_dt.strftime("%Y-%m-%d")
+    end_date = end_dt.strftime("%Y-%m-%d")
+
+    body_variants = _co_generate_body_variants(
+        probe_uuid, serial, start_date, end_date, 30,
+        CO_TEMPLATES["sleep_trend"], "SleepTrend_probe.pdf")
+
+    route = CO_REPORT_ROUTES[0]  # /proxy/ is the only live route
+    for idx, (variant_name, gen_body) in enumerate(body_variants, start=1):
         try:
             gr = live_sess.post(f"{CO_BASE}{route}", json=gen_body,
                                 headers=hdrs, timeout=60)
             gen_snap = {
                 "url": f"{CO_BASE}{route}",
+                "variant": variant_name,
+                "body_sent": gen_body,
                 "status": gr.status_code,
                 "content_type": gr.headers.get("Content-Type"),
-                "body_snippet": gr.text[:500],
+                "content_length": gr.headers.get("Content-Length"),
+                "body_snippet": gr.text[:500] if gr.content[:5] != b"%PDF-"
+                                else f"<PDF {len(gr.content)} bytes>",
+                "body_hex_head": gr.content[:20].hex() if gr.content else "",
                 "is_pdf": gr.content[:5] == b"%PDF-",
             }
+            if gr.status_code == 200 and gr.content[:5] == b"%PDF-":
+                log(f"19.{idx} [{variant_name}] SUCCESS — PDF received!", gen_snap)
+                break
         except Exception as e:
-            gen_snap = {"url": f"{CO_BASE}{route}",
+            gen_snap = {"url": f"{CO_BASE}{route}", "variant": variant_name,
                         "transport_error": f"{type(e).__name__}: {e}"}
-        log(f"19.{idx} POST generate via {route}", gen_snap)
+        log(f"19.{idx} [{variant_name}] POST generate", gen_snap)
 
     _save(report)
     print(f"\nFull capture saved to {OUT_PATH} — share that file (no secrets).", flush=True)

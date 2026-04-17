@@ -24,12 +24,24 @@ https://www.careorchestrator.com/#/patient/{patientUuid}/therapydata/reports
 (e.g. Stephen Moore → `15a98a68-d7f0-474f-b6ff-3a7d069f9af6`). Reuse it — do not
 re-resolve.
 
-**Report generation endpoint:**
+**Report generation endpoint (confirmed April 2026 live probe):**
 ```
-POST https://www.careorchestrator.com/api/documents-v1-0-server/reports/generate
+POST https://www.careorchestrator.com/proxy/documents-v1-0-server/reports/generate
 ```
-A GET returns "Cannot GET" — confirms the route exists and is POST-only. Body shape
-and required headers are NOT yet captured (see capture plan below).
+The `/api/` variant (`/api/documents-v1-0-server/reports/generate`) returns 404
+"Cannot POST" — that route does not exist on the backend. Only `/proxy/` is live.
+
+Response on 400: `Content-Type: application/octet-stream`, empty body. This means
+the endpoint returns binary data (likely a direct PDF) on success, and an empty
+400 when the body is wrong — no JSON error, no field-level rejection message.
+
+Auth header: confirmed `auth_token: <JSON stringified token>` only. `Bearer` and
+`X-Auth-Token` variants both 401.
+
+Body shape: NOT yet confirmed. The body from the old `therapyreporttemplates`
+endpoint (templateId, patientId, deviceSerialNumber, startDate, endDate, etc.)
+returns 400. The skill now tries 6 body variants on each attempt and captures all
+responses — see `scripts/utils.py _co_generate_body_variants()`.
 
 **Report templates visible in the dropdown:**
 - Compliance Report
