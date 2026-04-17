@@ -279,10 +279,10 @@ def main():
     )
     log("16. therapyreporttemplates templates list", old_reports_snap)
 
-    # 11. Live Sleep Trend generate probe. We pick a real patient from patientgateway
-    # wildcard, resolve their device serial, and POST the best-guess body to
-    # documents-v1-0-server/reports/generate on both route variants. Whatever the
-    # server says — success or rejection — is what unblocks CO report automation.
+    # 11. Live reports probe. Previous run showed ALL body variants return 400 with
+    # empty octet-stream body — uniform rejection regardless of body shape means the
+    # issue is likely a missing header (XSRF, Origin, Referer, Accept, etc.), not
+    # the POST body. This probe focuses on header variants instead.
     from utils import CO_TEMPLATES, CO_REPORT_ROUTES, co_get_equipment_serial
     live_sess = new_session()
     hdrs = header_variants["auth_token-json"]
@@ -296,56 +296,142 @@ def main():
         _save(report)
         print(f"\nFull capture saved to {OUT_PATH}.", flush=True)
         return 0
-    live_sess.post(f"{CO_BASE}/proxy/auth-v2-server/sessions/context",
-                   json={"orgId": auth2.get("userTopOrgId")}, headers=hdrs, timeout=30)
 
+    # Context set + re-login (the full auth dance)
+    live_hdrs = {"Accept": "application/json", "Content-Type": "application/json",
+                 "auth_token": json.dumps(auth2.get("token", {}))}
+    live_sess.post(f"{CO_BASE}/proxy/auth-v2-server/sessions/context",
+                   json={"orgId": auth2.get("userTopOrgId")}, headers=live_hdrs, timeout=30)
+    ok3, auth3, _ = try_login(live_sess, username, password, _co_login_url,
+                              offset=snap.get("offset_used", 713))
+    if ok3:
+        live_hdrs = {"Accept": "application/json", "Content-Type": "application/json",
+                     "auth_token": json.dumps(auth3.get("token", {}))}
+
+    # 17. Dump ALL cookies — look for XSRF-TOKEN or similar
+    cookie_dump = {c.name: c.value for c in live_sess.cookies}
+    log("17. session cookies after full auth dance", cookie_dump)
+
+    xsrf_cookie = None
+    for name in ["XSRF-TOKEN", "xsrf-token", "CSRF-TOKEN", "csrf-token",
+                 "_csrf", "csrftoken", "JSESSIONID"]:
+        if name in cookie_dump:
+            xsrf_cookie = (name, cookie_dump[name])
+            break
+    if not xsrf_cookie:
+        for name, val in cookie_dump.items():
+            if "csrf" in name.lower() or "xsrf" in name.lower():
+                xsrf_cookie = (name, val)
+                break
+    log("17a. XSRF cookie", {"found": bool(xsrf_cookie),
+                              "name": xsrf_cookie[0] if xsrf_cookie else None,
+                              "value_len": len(xsrf_cookie[1]) if xsrf_cookie else 0})
+
+    # 18. Find a patient WITH a serial number (search more patients)
     wc = live_sess.get(
         f"{CO_BASE}/proxy/patientgateway-v1-server/patient/search/wildcard",
-        params={"page": "1", "pageSize": "5", "sortBy": "lastName",
+        params={"page": "1", "pageSize": "50", "sortBy": "lastName",
                 "sortOrder": "asc", "active": "true", "inactive": "false"},
-        headers=hdrs, timeout=30)
+        headers=live_hdrs, timeout=30)
     try:
         pts = wc.json() if wc.status_code == 200 else []
     except Exception:
         pts = []
     if not pts or not isinstance(pts, list):
-        log("17. no patients returned from wildcard — cannot probe reports",
-            {"status": wc.status_code, "body_snippet": wc.text[:200]})
+        log("18. no patients returned", {"status": wc.status_code})
         _save(report)
-        print(f"\nFull capture saved to {OUT_PATH}.", flush=True)
         return 0
 
-    probe_pt = pts[0]
-    probe_uuid = probe_pt.get("patientId")
-    log("17. probe patient selected", {"patientId": probe_uuid,
-                                       "name": f"{probe_pt.get('lastName','')}, "
-                                               f"{probe_pt.get('firstName','')}"})
+    log("18. patients fetched", {"count": len(pts)})
 
-    serial, eq_info = co_get_equipment_serial(live_sess, hdrs, probe_uuid)
-    log("18. equipment lookup", {"serial_found": bool(serial),
-                                  "serial": serial if serial else None,
-                                  "error": None if serial else eq_info.get("error"),
-                                  "body_snippet": None if serial else eq_info.get("body_snippet")})
+    # Find first patient with a serial
+    probe_uuid = None
+    serial = None
+    probe_name = None
+    for pt in pts:
+        pid = pt.get("patientId")
+        s, eq = co_get_equipment_serial(live_sess, live_hdrs, pid)
+        if s:
+            probe_uuid = pid
+            serial = s
+            probe_name = f"{pt.get('lastName','')}, {pt.get('firstName','')}"
+            log("18a. patient WITH serial found", {"uuid": probe_uuid,
+                                                    "name": probe_name,
+                                                    "serial": serial})
+            break
 
-    from utils import _co_generate_body_variants
+    if not probe_uuid:
+        # Fall back to first patient, no serial
+        probe_uuid = pts[0].get("patientId")
+        probe_name = f"{pts[0].get('lastName','')}, {pts[0].get('firstName','')}"
+        log("18a. no patient with serial in first 50 — using first patient",
+            {"uuid": probe_uuid, "name": probe_name})
+
+    # 19. Header variant sweep on the generate endpoint.
+    # Use a single body shape (minimal: templateId + patientId + dates + serial if avail).
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=30)
-    start_date = start_dt.strftime("%Y-%m-%d")
-    end_date = end_dt.strftime("%Y-%m-%d")
+    gen_body = {
+        "templateId": CO_TEMPLATES["sleep_trend"],
+        "patientId": probe_uuid,
+        "startDate": start_dt.strftime("%Y-%m-%d"),
+        "endDate": end_dt.strftime("%Y-%m-%d"),
+    }
+    if serial:
+        gen_body["deviceSerialNumber"] = serial
 
-    body_variants = _co_generate_body_variants(
-        probe_uuid, serial, start_date, end_date, 30,
-        CO_TEMPLATES["sleep_trend"], "SleepTrend_probe.pdf")
+    route = CO_REPORT_ROUTES[0]
+    gen_url = f"{CO_BASE}{route}"
 
-    route = CO_REPORT_ROUTES[0]  # /proxy/ is the only live route
-    for idx, (variant_name, gen_body) in enumerate(body_variants, start=1):
+    # Build header variants to try
+    hdr_variants = []
+
+    # A: current (known 400)
+    hdr_variants.append(("baseline", {**live_hdrs}))
+
+    # B: + X-Requested-With (Angular default for AJAX)
+    hdr_variants.append(("+ x-requested-with", {**live_hdrs,
+                         "X-Requested-With": "XMLHttpRequest"}))
+
+    # C: + Origin + Referer
+    hdr_variants.append(("+ origin+referer", {**live_hdrs,
+                         "Origin": "https://www.careorchestrator.com",
+                         "Referer": "https://www.careorchestrator.com/"}))
+
+    # D: + Accept: application/octet-stream (match expected response type)
+    hdr_variants.append(("+ accept-octet", {**live_hdrs,
+                         "Accept": "application/octet-stream, application/json"}))
+
+    # E: + XSRF header (if cookie found)
+    if xsrf_cookie:
+        for hdr_name in ["X-XSRF-TOKEN", "X-CSRF-TOKEN"]:
+            hdr_variants.append((f"+ {hdr_name}", {**live_hdrs,
+                                 hdr_name: xsrf_cookie[1]}))
+
+    # F: kitchen sink — all of the above combined
+    kitchen = {**live_hdrs,
+               "X-Requested-With": "XMLHttpRequest",
+               "Origin": "https://www.careorchestrator.com",
+               "Referer": "https://www.careorchestrator.com/",
+               "Accept": "application/octet-stream, application/json"}
+    if xsrf_cookie:
+        kitchen["X-XSRF-TOKEN"] = xsrf_cookie[1]
+        kitchen["X-CSRF-TOKEN"] = xsrf_cookie[1]
+    hdr_variants.append(("kitchen_sink", kitchen))
+
+    # G: Content-Type: application/octet-stream instead of JSON (maybe it wants binary?)
+    hdr_variants.append(("content-type-octet", {**live_hdrs,
+                         "Content-Type": "application/octet-stream"}))
+
+    log("19. body used for all header variants", gen_body)
+
+    for idx, (hdr_label, test_hdrs) in enumerate(hdr_variants, start=1):
         try:
-            gr = live_sess.post(f"{CO_BASE}{route}", json=gen_body,
-                                headers=hdrs, timeout=60)
+            gr = live_sess.post(gen_url, json=gen_body, headers=test_hdrs, timeout=60)
             gen_snap = {
-                "url": f"{CO_BASE}{route}",
-                "variant": variant_name,
-                "body_sent": gen_body,
+                "headers_label": hdr_label,
+                "extra_headers": {k: v for k, v in test_hdrs.items()
+                                  if k not in live_hdrs or test_hdrs[k] != live_hdrs.get(k)},
                 "status": gr.status_code,
                 "content_type": gr.headers.get("Content-Type"),
                 "content_length": gr.headers.get("Content-Length"),
@@ -353,14 +439,23 @@ def main():
                                 else f"<PDF {len(gr.content)} bytes>",
                 "body_hex_head": gr.content[:20].hex() if gr.content else "",
                 "is_pdf": gr.content[:5] == b"%PDF-",
+                "response_headers": {k: v for k, v in gr.headers.items()
+                                     if k.lower() in ("content-type", "content-length",
+                                                      "x-request-id", "set-cookie",
+                                                      "www-authenticate", "x-xsrf-token")},
             }
-            if gr.status_code == 200 and gr.content[:5] == b"%PDF-":
-                log(f"19.{idx} [{variant_name}] SUCCESS — PDF received!", gen_snap)
+            if gr.status_code == 200 and len(gr.content) > 0:
+                log(f"20.{idx} [{hdr_label}] GOT CONTENT!", gen_snap)
+                if gr.content[:5] == b"%PDF-":
+                    log(f"  PDF received — {hdr_label} is the winning combo", None)
                 break
+            if gr.status_code != 400:
+                log(f"20.{idx} [{hdr_label}] DIFFERENT STATUS — {gr.status_code}", gen_snap)
+            else:
+                log(f"20.{idx} [{hdr_label}] 400 (same as before)", gen_snap)
         except Exception as e:
-            gen_snap = {"url": f"{CO_BASE}{route}", "variant": variant_name,
-                        "transport_error": f"{type(e).__name__}: {e}"}
-        log(f"19.{idx} [{variant_name}] POST generate", gen_snap)
+            log(f"20.{idx} [{hdr_label}] EXCEPTION",
+                {"error": f"{type(e).__name__}: {e}"})
 
     _save(report)
     print(f"\nFull capture saved to {OUT_PATH} — share that file (no secrets).", flush=True)
