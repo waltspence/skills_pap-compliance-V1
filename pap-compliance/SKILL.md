@@ -67,7 +67,7 @@ resume instructions. They do NOT auto-retrigger MFA — the user re-auths betwee
 | Platform | Manufacturer | Report | Endpoint Status |
 |---|---|---|---|
 | AirView | ResMed | Compliance and Therapy | ✅ Full pipeline |
-| Care Orchestrator | Philips | **Sleep Trend** (Trilogy Detail for vent patients) | ✅ Search, 🟡 Report gen automated with best-guess body; captures response on failure |
+| Care Orchestrator | Philips | **Sleep Trend** (Trilogy Detail for vent patients) | ✅ Search, ❌ Report gen blocked on HAR capture (see `references/co_reports_api.md`) |
 | React Health | 3B | Compliance and Therapy | ✅ Auth/search, PDF needs work |
 
 **CO report type:** The canonical CO pull is the **Sleep Trend** report

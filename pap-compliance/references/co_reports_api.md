@@ -24,24 +24,39 @@ https://www.careorchestrator.com/#/patient/{patientUuid}/therapydata/reports
 (e.g. Stephen Moore → `15a98a68-d7f0-474f-b6ff-3a7d069f9af6`). Reuse it — do not
 re-resolve.
 
-**Report generation endpoint (confirmed April 2026 live probe):**
+**Report generation endpoint (confirmed April 2026, 6 probe rounds):**
 ```
 POST https://www.careorchestrator.com/proxy/documents-v1-0-server/reports/generate
 ```
-The `/api/` variant (`/api/documents-v1-0-server/reports/generate`) returns 404
-"Cannot POST" — that route does not exist on the backend. Only `/proxy/` is live.
 
-Response on 400: `Content-Type: application/octet-stream`, empty body. This means
-the endpoint returns binary data (likely a direct PDF) on success, and an empty
-400 when the body is wrong — no JSON error, no field-level rejection message.
+**What's confirmed:**
+- Service: `documents-v1-0-server` (11 alternate service names scanned — all 404)
+- Path: `/reports/generate` (8 path variants tried — all Spring 404)
+- Auth: `auth_token: <JSON stringified token>` (only working variant)
+- Response format: `application/octet-stream` — likely direct PDF on success
 
-Auth header: confirmed `auth_token: <JSON stringified token>` only. `Bearer` and
-`X-Auth-Token` variants both 401.
+**What's NOT confirmed — blocked on HAR capture:**
+- POST body shape. 6 rounds of probing (~30 body/header/path permutations)
+  all returned `400 / application/octet-stream / Content-Length: 0 / empty`.
+  The server gives zero field-level error. The body shape from the old
+  `therapyreporttemplates` service (templateId, patientId, startDate, endDate,
+  deviceSerialNumber) does NOT work on this endpoint.
 
-Body shape: NOT yet confirmed. The body from the old `therapyreporttemplates`
-endpoint (templateId, patientId, deviceSerialNumber, startDate, endDate, etc.)
-returns 400. The skill now tries 6 body variants on each attempt and captures all
-responses — see `scripts/utils.py _co_generate_body_variants()`.
+**Ruled out:**
+- Header issue (CORS, Content-Type, X-Requested-With, Accept, Origin, Referer)
+- Missing patient context (loaded patient detail + equipment before generate)
+- CSRF/XSRF (cookie jar is empty; no CSRF mechanism)
+- Old endpoint (`therapyreporttemplates-v1-0-server/api/v1/reports/generate` → 404)
+- `/api/` path variant (404 "Cannot POST")
+
+**To unblock:** one HAR capture from Chrome DevTools:
+1. Log into CO in Chrome, F12 → Network tab, filter `generate`
+2. Navigate to a patient → generate a Sleep Trend report
+3. Right-click the request → Copy → Copy as cURL (bash)
+4. Paste the cURL into this repo or a chat session
+
+That gives us the exact body shape in 30 seconds. Until then, CO
+report generation cannot be automated.
 
 **Report templates visible in the dropdown:**
 - Compliance Report
