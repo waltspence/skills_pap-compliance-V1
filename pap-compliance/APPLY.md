@@ -89,6 +89,37 @@ reports API moved to `documents-v1-0-server` is still real, but unrelated to thi
   "reports gen permanently broken" language was a wrong turn; the live path is
   `POST /api/documents-v1-0-server/reports/generate`.
 
+## Round 2 hardening (April 2026, repo landing)
+
+After the CO-connect root cause was fixed, did a systematic pass for the same class
+of bug across the other auth paths and the download pipeline:
+
+- **AV `authn` and MFA verify** now raise `ValueError("HTTP {status} at {url} — body[:300]={…}")`
+  on 4xx/5xx or non-JSON responses, same pattern as CO `_co_login`. Previously,
+  Okta returning HTML (429 / anti-bot / rate limit) would surface as
+  `JSONDecodeError: Expecting value: line 1 column 1` — unactionable.
+- **AV no-email-MFA case** now raises a clear error listing which factors ARE enrolled
+  on the account, instead of an opaque `IndexError` from `[...][0]` on an empty list.
+- **CO `sessions/context` POST** is now checked. A silent 401/403 there left the
+  session on the default org and made patientgateway searches silently return wrong-org
+  or empty data — looked like "the search works but finds nothing." Now raises with
+  status + body + orgId so the retry loop surfaces it.
+- **`load_creds`** raises a descriptive `FileNotFoundError` pointing at the expected
+  path and reminding the caller to use `AskUserQuestion`, not a bash heredoc.
+- **`download_av_report`** captures up to 200 chars of the response body on FAIL so
+  "HTML instead of PDF" failures (the AirView SUPPLIED 30-day edge case noted in the
+  Known Issues) can be triaged without a network capture.
+- **`download_reports.py` chunk summary** now actually prints the counts it was already
+  tracking: patients with ≥1 successful PDF, patients with failures only, total PDFs
+  on disk with size. Previously computed `pdf_count` and `total_size` in dead code.
+
+Verified locally:
+- `load_creds()` with missing file: descriptive error, no stack.
+- `auth_co_rh` with mocked 401 on `sessions/context`: 3 retries, each failing with
+  `ValueError: sessions/context HTTP 401 — body[:200]='{"error":"unauthorized"}' (orgId='org-1')`.
+- `auth_co_rh` with injected `NameError`: still fails fast in 0.12s (regression test).
+- All 9 scripts parse cleanly.
+
 ## Follow-up cleanup (April 2026, repo landing)
 
 Applied on top of the v3 patch above while moving the skill into version control:

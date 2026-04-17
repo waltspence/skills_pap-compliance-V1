@@ -51,9 +51,18 @@ def download_av_report(av_session, ecn, portal_name, period, today_str, reports_
                 f.write(r.content)
             return {"status": "OK", "file": filename, "size": len(r.content)}
         else:
-            return {"status": "FAIL", "code": r.status_code, "size": len(r.content)}
+            # Capture a body snippet so "HTML instead of PDF" failures are
+            # diagnosable — the AirView SUPPLIED 30-day path does this occasionally,
+            # and without the snippet we can't tell if it was a session boot, a
+            # Cloudflare challenge, or a real backend error.
+            try:
+                snippet = r.content[:200].decode("utf-8", errors="replace")
+            except Exception:
+                snippet = repr(r.content[:200])
+            return {"status": "FAIL", "code": r.status_code,
+                    "size": len(r.content), "body_snippet": snippet}
     except Exception as e:
-        return {"status": "ERROR", "error": str(e)}
+        return {"status": "ERROR", "error": f"{type(e).__name__}: {e}"}
 
 
 DL_STATE_FILE = "/home/claude/download_state.json"
@@ -189,11 +198,15 @@ def main():
         json.dump(existing_log + log, f, indent=2, default=str)
 
     pdf_count = len([f for f in os.listdir(args.reports_dir) if f.endswith(".pdf")])
-    total_size = sum(os.path.getsize(os.path.join(args.reports_dir, f))
-                     for f in os.listdir(args.reports_dir) if f.endswith(".pdf"))
+    total_mb = sum(os.path.getsize(os.path.join(args.reports_dir, f))
+                   for f in os.listdir(args.reports_dir) if f.endswith(".pdf")) / (1024 * 1024)
 
     print(f"\n{'=' * 50}")
-    print(f"CHUNK COMPLETE: downloads {start+1}-{min(end, len(full_queue))}")
+    print(f"CHUNK COMPLETE: downloads {start+1}-{min(end, len(full_queue))} of {len(full_queue)}")
+    print(f"  Patients with ≥1 successful PDF: {downloaded}")
+    print(f"  Patients with failures only:     {failed}")
+    print(f"  PDFs on disk:                    {pdf_count} ({total_mb:.1f} MB)")
+    print(f"  Log:                             {log_path}")
 
 
 if __name__ == "__main__":

@@ -27,8 +27,15 @@ OUTPUTS_DIR = "/mnt/user-data/outputs"
 # ═══════════════════════════════════════════════════
 
 def load_creds(path=CREDS_PATH):
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Credentials file not found at {path}. "
+            "On first run, the skill should prompt the user via AskUserQuestion and "
+            "write the JSON to this path. Do not paste passwords into bash heredocs."
+        )
 
 
 # ═══════════════════════════════════════════════════
@@ -292,8 +299,17 @@ def auth_co_rh(creds, session_dir=SESSION_DIR):
                 co_session = new_session()
                 co_auth, co_headers, co_org_id = _co_login(
                     co_session, creds["CareOrchestrator"]["username"], creds["CareOrchestrator"]["password"])
-                co_session.post(f"{CO_BASE}/proxy/auth-v2-server/sessions/context",
-                                json={"orgId": co_org_id}, headers=co_headers, timeout=30)
+                # Set org context. A silent failure here (e.g. 401/403) leaves the
+                # session on a default org — patientgateway searches will then return
+                # wrong-org or empty results with no visible symptom. Check and raise
+                # so the retry loop surfaces it.
+                ctx_r = co_session.post(
+                    f"{CO_BASE}/proxy/auth-v2-server/sessions/context",
+                    json={"orgId": co_org_id}, headers=co_headers, timeout=30)
+                if ctx_r.status_code >= 400:
+                    raise ValueError(
+                        f"sessions/context HTTP {ctx_r.status_code} — "
+                        f"body[:200]={ctx_r.text[:200]!r} (orgId={co_org_id!r})")
                 co_auth2, co_headers2, _ = _co_login(
                     co_session, creds["CareOrchestrator"]["username"], creds["CareOrchestrator"]["password"])
                 import os as _os
@@ -388,13 +404,24 @@ def auth_av_trigger(creds, session_dir=SESSION_DIR):
     state_msg = f"state captured ({real_state[:20]}...)" if real_state else "⚠️ state NOT captured"
 
     # Primary auth
-    r2 = av_session.post("https://airviewid.resmed.com/api/v1/authn", json={
+    authn_url = "https://airviewid.resmed.com/api/v1/authn"
+    r2 = av_session.post(authn_url, json={
         "username": creds["AirView"]["email"],
         "password": creds["AirView"]["password"],
         "options": {"multiOptionalFactorEnroll": True, "warnBeforePasswordExpired": True}
     }, headers={"Accept": "application/json", "Content-Type": "application/json"}, timeout=30)
 
-    auth = r2.json()
+    # Guard against HTML/rate-limit responses: same failure mode that hid behind a
+    # JSONDecodeError in CO. Okta can return HTML on 429, 5xx, or anti-bot gates.
+    if r2.status_code >= 400:
+        raise ValueError(
+            f"AV authn HTTP {r2.status_code} at {authn_url} — body[:300]={r2.text[:300]!r}")
+    try:
+        auth = r2.json()
+    except Exception:
+        raise ValueError(
+            f"AV authn non-JSON {r2.status_code} at {authn_url} — body[:300]={r2.text[:300]!r}")
+
     if auth.get("status") != "MFA_REQUIRED":
         if auth.get("status") == "SUCCESS":
             # No MFA needed — complete OAuth directly
@@ -412,8 +439,15 @@ def auth_av_trigger(creds, session_dir=SESSION_DIR):
         raise ValueError(f"Unexpected AV auth status: {auth.get('status')}")
 
     state_token = auth["stateToken"]
-    email_factor = [f for f in auth["_embedded"]["factors"] if f["factorType"] == "email"][0]
-    verify_url = email_factor["_links"]["verify"]["href"]
+    factors = auth.get("_embedded", {}).get("factors", [])
+    email_factors = [f for f in factors if f.get("factorType") == "email"]
+    if not email_factors:
+        enrolled = sorted({f.get("factorType", "?") for f in factors})
+        raise ValueError(
+            f"No email MFA factor on AV account. Enrolled factors: {enrolled or 'none'}. "
+            "The skill only supports email MFA (codes arrive in inbox). Enroll email MFA "
+            "at airviewid.resmed.com or switch accounts.")
+    verify_url = email_factors[0]["_links"]["verify"]["href"]
 
     # Trigger MFA — do NOT call .json() on this response
     r3 = av_session.post(verify_url, json={"stateToken": state_token},
@@ -453,7 +487,14 @@ def auth_av_verify(code, session_dir=SESSION_DIR):
     r = av_session.post(verify_url, json={"stateToken": state_token, "passCode": code},
                         headers={"Accept": "application/json", "Content-Type": "application/json"},
                         timeout=30)
-    auth = r.json()
+    if r.status_code >= 400:
+        raise ValueError(
+            f"AV MFA verify HTTP {r.status_code} — body[:300]={r.text[:300]!r}")
+    try:
+        auth = r.json()
+    except Exception:
+        raise ValueError(
+            f"AV MFA verify non-JSON {r.status_code} — body[:300]={r.text[:300]!r}")
     if auth.get("status") != "SUCCESS":
         raise ValueError(f"MFA verify failed: {auth.get('status')} — {str(auth)[:200]}")
 
