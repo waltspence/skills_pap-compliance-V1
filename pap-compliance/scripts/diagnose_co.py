@@ -279,6 +279,80 @@ def main():
     )
     log("16. therapyreporttemplates templates list", old_reports_snap)
 
+    # 11. Live Sleep Trend generate probe. We pick a real patient from patientgateway
+    # wildcard, resolve their device serial, and POST the best-guess body to
+    # documents-v1-0-server/reports/generate on both route variants. Whatever the
+    # server says — success or rejection — is what unblocks CO report automation.
+    from utils import CO_TEMPLATES, CO_REPORT_ROUTES, co_get_equipment_serial
+    live_sess = new_session()
+    hdrs = header_variants["auth_token-json"]
+
+    # Re-do auth on live_sess so cookies are there
+    _co_login_url = f"{CO_BASE}/proxy/sapphiregateway-v1-server/authentication/logins"
+    ok2, auth2, login_snap = try_login(live_sess, username, password, _co_login_url,
+                                       offset=snap.get("offset_used", 713))
+    if not ok2:
+        log("17. re-login for reports probe FAILED", {"snapshot": login_snap})
+        _save(report)
+        print(f"\nFull capture saved to {OUT_PATH}.", flush=True)
+        return 0
+    live_sess.post(f"{CO_BASE}/proxy/auth-v2-server/sessions/context",
+                   json={"orgId": auth2.get("userTopOrgId")}, headers=hdrs, timeout=30)
+
+    wc = live_sess.get(
+        f"{CO_BASE}/proxy/patientgateway-v1-server/patient/search/wildcard",
+        params={"page": "1", "pageSize": "5", "sortBy": "lastName",
+                "sortOrder": "asc", "active": "true", "inactive": "false"},
+        headers=hdrs, timeout=30)
+    try:
+        pts = wc.json() if wc.status_code == 200 else []
+    except Exception:
+        pts = []
+    if not pts or not isinstance(pts, list):
+        log("17. no patients returned from wildcard — cannot probe reports",
+            {"status": wc.status_code, "body_snippet": wc.text[:200]})
+        _save(report)
+        print(f"\nFull capture saved to {OUT_PATH}.", flush=True)
+        return 0
+
+    probe_pt = pts[0]
+    probe_uuid = probe_pt.get("patientId")
+    log("17. probe patient selected", {"patientId": probe_uuid,
+                                       "name": f"{probe_pt.get('lastName','')}, "
+                                               f"{probe_pt.get('firstName','')}"})
+
+    serial, eq_info = co_get_equipment_serial(live_sess, hdrs, probe_uuid)
+    log("18. equipment lookup", {"serial_found": bool(serial),
+                                  "serial": serial if serial else None,
+                                  "error": None if serial else eq_info.get("error"),
+                                  "body_snippet": None if serial else eq_info.get("body_snippet")})
+
+    gen_body = {
+        "templateId": CO_TEMPLATES["sleep_trend"],
+        "patientId": probe_uuid,
+        "deviceSerialNumber": serial or "UNKNOWN",
+        "startDate": "2026-03-18",
+        "endDate": "2026-04-17",
+        "fileName": "SleepTrend_probe.pdf",
+        "reportComplianceByBlowerTime": False,
+        "bestNumberOfDays": 30,
+    }
+    for idx, route in enumerate(CO_REPORT_ROUTES, start=1):
+        try:
+            gr = live_sess.post(f"{CO_BASE}{route}", json=gen_body,
+                                headers=hdrs, timeout=60)
+            gen_snap = {
+                "url": f"{CO_BASE}{route}",
+                "status": gr.status_code,
+                "content_type": gr.headers.get("Content-Type"),
+                "body_snippet": gr.text[:500],
+                "is_pdf": gr.content[:5] == b"%PDF-",
+            }
+        except Exception as e:
+            gen_snap = {"url": f"{CO_BASE}{route}",
+                        "transport_error": f"{type(e).__name__}: {e}"}
+        log(f"19.{idx} POST generate via {route}", gen_snap)
+
     _save(report)
     print(f"\nFull capture saved to {OUT_PATH} — share that file (no secrets).", flush=True)
     return 0

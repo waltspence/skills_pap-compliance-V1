@@ -67,7 +67,7 @@ resume instructions. They do NOT auto-retrigger MFA — the user re-auths betwee
 | Platform | Manufacturer | Report | Endpoint Status |
 |---|---|---|---|
 | AirView | ResMed | Compliance and Therapy | ✅ Full pipeline |
-| Care Orchestrator | Philips | **Sleep Trend** (Trilogy Detail for vent patients) | ✅ Search, ❌ Report gen pending capture (see `references/co_reports_api.md`) |
+| Care Orchestrator | Philips | **Sleep Trend** (Trilogy Detail for vent patients) | ✅ Search, 🟡 Report gen automated with best-guess body; captures response on failure |
 | React Health | 3B | Compliance and Therapy | ✅ Auth/search, PDF needs work |
 
 **CO report type:** The canonical CO pull is the **Sleep Trend** report
@@ -185,18 +185,26 @@ Session check every 5 patients. On expiry: checkpoint + `sys.exit(2)` with resum
 
 Output: PDFs in `/home/claude/reports/` + `download_log.json`.
 
-**CO report generation — NOT YET AUTOMATED.** `download_reports.py` pulls AirView
-PDFs only. For Care Orchestrator patients the flow is:
+**CO Sleep Trend download — first automated attempt.** After the AV pass,
+`download_reports.py` runs a CO pass for every CO-DOB-verified patient:
 
-1. Mark the patient as "CO manual pull" in the review queue (Phase 3.5).
-2. Tell the user they need to pull the **Sleep Trend** report (template id
-   `ebedbf1a-be12-4756-9661-85dc7bec1792`, "Trilogy Detail" for vent patients)
-   manually from `https://www.careorchestrator.com/#/patient/{patientUuid}/therapydata/reports`.
-3. Skip CO for that patient in the spreadsheet — the row will show as "manual pull".
+1. Resolve the patient's primary device serial via
+   `GET /proxy/equipment-v1-0-server/patient/{uuid}/equipment`.
+2. POST the Sleep Trend body to both route variants of
+   `documents-v1-0-server/reports/generate` (see `references/co_reports_api.md`).
+3. On a direct PDF response, save it. On a JSON response with `presignedUrl` or
+   `documentId`, follow up and save the PDF. On any failure, append the full
+   response (status + headers + body[:500]) to `/home/claude/co_generate_capture.json`.
 
-To get CO automated, capture the `POST /api/documents-v1-0-server/reports/generate`
-body + headers per `references/co_reports_api.md`. The capture plan specifies
-**Sleep Trend** (not Compliance Report) so the recorded body matches our target.
+The POST body is a best guess extrapolated from the old therapyreporttemplates
+body shape — if the server rejects a field, the capture file tells you exactly
+which one, and the next code iteration is narrow. Until the first live run lands,
+treat CO output as experimental and audit the capture file after every run.
+
+If CO fails for a patient, the spreadsheet row shows the failure and the user
+can still pull the **Sleep Trend** report (template id
+`ebedbf1a-be12-4756-9661-85dc7bec1792`, or "Trilogy Detail" for vent patients)
+manually from `https://www.careorchestrator.com/#/patient/{patientUuid}/therapydata/reports`.
 
 ### Phase 5 — Spreadsheet + ZIP
 ```bash

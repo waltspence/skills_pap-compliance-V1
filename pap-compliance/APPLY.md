@@ -89,6 +89,47 @@ reports API moved to `documents-v1-0-server` is still real, but unrelated to thi
   "reports gen permanently broken" language was a wrong turn; the live path is
   `POST /api/documents-v1-0-server/reports/generate`.
 
+## CO Sleep Trend download — first automated attempt (April 2026)
+
+Implemented the speculative CO download path so we stop waiting for a browser
+DevTools capture from Walt.
+
+- `utils.download_co_sleep_trend(co_session, co_headers, patient_uuid, serial)`:
+  builds the best-guess POST body (shape borrowed from the old
+  therapyreporttemplates body in care_orchestrator.md), tries both
+  `/api/documents-v1-0-server/reports/generate` and
+  `/proxy/documents-v1-0-server/reports/generate`, and handles three response
+  shapes: direct PDF, JSON with a `presignedUrl`, or JSON with a `documentId`
+  that then gets looked up via `/proxy/documents-v1-0-server/reports/presigned`.
+  On any failure, appends the full response to `/home/claude/co_generate_capture.json`
+  so the next iteration has status + headers + body[:500] to work from.
+- `utils.co_get_equipment_serial(...)`: resolves the primary device serial
+  via `equipment-v1-0-server`.
+- `download_reports.py`: runs a CO pass after the AV pass, gated on
+  co_session.pkl presence. Per-patient lines print OK + method, or FAIL +
+  pointer to the capture file. The chunk-complete summary now shows
+  AV successes/failures, CO successes/failures, and total PDFs on disk.
+- `diagnose_co.py`: added steps 17-19 — picks a real patient from the
+  wildcard search, resolves their serial, and POSTs the Sleep Trend generate
+  body to both route variants. Whatever the server says on the first live
+  run is the unlock.
+- `SKILL.md` Phase 4: "NOT YET AUTOMATED" replaced with the real flow; the
+  platforms-table status for CO is now 🟡 (automated, speculative) instead
+  of ❌ (pending capture).
+
+Smoke-tested with mocked sessions:
+- Direct PDF: saved, returns OK, method=direct_pdf.
+- JSON presignedUrl: follow-up GET, PDF saved, method=presigned.
+- 400 then 500 on both routes: FAIL, capture file has full bodies for triage.
+
+Still unknown until a live run:
+- Whether the POST body shape is accepted or rejected (and by which field).
+- Whether the response is direct PDF or async with a documentId to poll.
+- Whether any extra headers (CSRF, X-XSRF-TOKEN, JWT bearer) are required.
+
+Whatever it is, the first live run with real creds produces either a PDF or
+`/home/claude/co_generate_capture.json` that pinpoints what needs to change.
+
 ## Round 2 hardening (April 2026, repo landing)
 
 After the CO-connect root cause was fixed, did a systematic pass for the same class

@@ -202,6 +202,249 @@ def co_encrypt_password(password):
 
 
 # ═══════════════════════════════════════════════════
+# CO Report Download — Sleep Trend (standing SOP)
+# ═══════════════════════════════════════════════════
+
+CO_BASE = "https://www.careorchestrator.com"
+
+# Per references/care_orchestrator.md templates list. The Sleep Trend template
+# is our per-site standing target; Trilogy Detail is only for ventilator patients.
+CO_TEMPLATES = {
+    "sleep_trend":    "ebedbf1a-be12-4756-9661-85dc7bec1792",
+    "compliance_sum": "e9ff1ef7-bfac-468c-81c2-5d401790254e",
+    "detail":         "03b714a7-60a2-4971-b464-775554480bbb",
+    "summary":        "b1a1e0fc-30de-485b-bf8c-f61dcdea9fe9",
+    "patient":        "ecd5601b-03c1-4127-b0f6-60bc877ea413",
+}
+
+# Route variants we try. `/api/...` is the path confirmed in co_reports_api.md
+# (April 2026 capture). `/proxy/...` is the pattern used elsewhere in the skill
+# for other microservices; kept as a fallback since the service naming scheme
+# suggests it should also be reachable that way. Both land on documents-v1-0-server.
+CO_REPORT_ROUTES = [
+    "/api/documents-v1-0-server/reports/generate",
+    "/proxy/documents-v1-0-server/reports/generate",
+]
+
+
+def co_get_equipment_serial(co_session, co_headers, patient_uuid):
+    """
+    Fetch primary device serial number for a CO patient. Needed for report generate.
+    Returns (serial, equipment_record) or (None, {error: ...}).
+    """
+    url = f"{CO_BASE}/proxy/equipment-v1-0-server/patient/{patient_uuid}/equipment"
+    try:
+        r = co_session.get(url, headers=co_headers, timeout=30)
+    except Exception as e:
+        return None, {"error": f"transport: {type(e).__name__}: {e}"}
+    if r.status_code != 200:
+        return None, {"error": f"HTTP {r.status_code}", "body_snippet": r.text[:200]}
+    try:
+        equipment = r.json()
+    except Exception:
+        return None, {"error": "non-JSON equipment response", "body_snippet": r.text[:200]}
+    if not isinstance(equipment, list) or not equipment:
+        return None, {"error": "no equipment returned"}
+    primary = next((e for e in equipment if e.get("isPrimary")), equipment[0])
+    serial = primary.get("serialNumber")
+    if not serial:
+        return None, {"error": "primary equipment has no serialNumber", "record": primary}
+    return serial, primary
+
+
+def _co_generate_body(patient_uuid, serial, start_date, end_date, days,
+                      template_id, file_name):
+    """
+    Best-guess POST body for documents-v1-0-server/reports/generate. Shaped after
+    the therapyreporttemplates body that was documented in care_orchestrator.md —
+    same field names are a reasonable starting point since the templates library
+    is shared. If the server rejects a field, the error body + the capture file
+    will tell us which one so the next iteration is narrow.
+    """
+    return {
+        "templateId": template_id,
+        "patientId": patient_uuid,
+        "deviceSerialNumber": serial,
+        "startDate": start_date,
+        "endDate": end_date,
+        "fileName": file_name,
+        "reportComplianceByBlowerTime": False,
+        "bestNumberOfDays": days,
+    }
+
+
+def download_co_sleep_trend(co_session, co_headers, patient_uuid, serial,
+                            days=30, reports_dir=None,
+                            template_key="sleep_trend",
+                            capture_dir="/home/claude"):
+    """
+    Generate and download the Sleep Trend report for a CO patient.
+
+    This is the first automated CO download path in the skill — the POST body
+    shape is a best guess extrapolated from care_orchestrator.md's documented
+    body for the old therapyreporttemplates service. The server will almost
+    certainly reject the first attempt with a specific error telling us which
+    field is wrong; we capture the full response on every attempt so the next
+    iteration has a narrow target.
+
+    Behavior:
+      1. Try each route in CO_REPORT_ROUTES in order.
+      2. On 200 + PDF bytes: save to {reports_dir}/{patient_uuid}_sleep_trend.pdf.
+      3. On 200 + JSON: expect either a presigned URL or a documentId; follow up.
+      4. On any failure: append status + headers + body[:500] to the capture
+         file at {capture_dir}/co_generate_capture.json for triage.
+      5. Returns dict: {"status": "OK"|"FAIL"|"ERROR", ...}.
+
+    Does NOT retry — on failure, the user needs the capture, not more noise.
+    """
+    import os as _os
+    from datetime import datetime as _dt, timedelta as _td
+
+    reports_dir = reports_dir or REPORTS_DIR
+    _os.makedirs(reports_dir, exist_ok=True)
+    _os.makedirs(capture_dir, exist_ok=True)
+
+    template_id = CO_TEMPLATES.get(template_key, CO_TEMPLATES["sleep_trend"])
+    end_dt = _dt.now()
+    start_dt = end_dt - _td(days=days)
+    start_date = start_dt.strftime("%Y-%m-%d")
+    end_date = end_dt.strftime("%Y-%m-%d")
+    file_name = f"SleepTrend_{end_date}.pdf"
+    body = _co_generate_body(patient_uuid, serial, start_date, end_date, days,
+                             template_id, file_name)
+
+    captures = []
+    for route in CO_REPORT_ROUTES:
+        url = f"{CO_BASE}{route}"
+        attempt = {"url": url, "body": body, "ts": _dt.utcnow().isoformat()}
+        try:
+            r = co_session.post(url, json=body, headers=co_headers, timeout=60)
+        except Exception as e:
+            attempt.update({"transport_error": f"{type(e).__name__}: {e}"})
+            captures.append(attempt)
+            continue
+
+        ctype = r.headers.get("Content-Type", "")
+        attempt.update({
+            "status": r.status_code,
+            "content_type": ctype,
+            "content_length": r.headers.get("Content-Length"),
+            "response_headers": {k: v for k, v in r.headers.items()
+                                 if k.lower() in ("content-type", "content-length",
+                                                  "location", "x-request-id",
+                                                  "www-authenticate")},
+        })
+
+        # Case A: direct PDF
+        if r.status_code == 200 and r.content[:5] == b"%PDF-":
+            out = _os.path.join(reports_dir, f"{patient_uuid}_sleep_trend.pdf")
+            with open(out, "wb") as f:
+                f.write(r.content)
+            attempt["result"] = "direct_pdf"
+            captures.append(attempt)
+            _write_capture(capture_dir, patient_uuid, captures)
+            return {"status": "OK", "file": out, "size": len(r.content),
+                    "route": route, "method": "direct_pdf"}
+
+        # Case B: JSON response — may contain presigned URL or documentId
+        if r.status_code < 400 and "json" in ctype.lower():
+            try:
+                js = r.json()
+            except Exception:
+                js = None
+            attempt["response_body"] = (js if js is not None else r.text[:500])
+
+            presigned = None
+            doc_id = None
+            if isinstance(js, dict):
+                presigned = (js.get("presignedUrl") or js.get("url")
+                             or js.get("downloadUrl"))
+                doc_id = (js.get("documentId") or js.get("id")
+                          or js.get("reportId") or js.get("objectId"))
+
+            # Try presigned URL directly
+            if presigned:
+                try:
+                    pr = co_session.get(presigned, timeout=60)
+                    if pr.status_code == 200 and pr.content[:5] == b"%PDF-":
+                        out = _os.path.join(reports_dir, f"{patient_uuid}_sleep_trend.pdf")
+                        with open(out, "wb") as f:
+                            f.write(pr.content)
+                        attempt["result"] = "presigned_pdf"
+                        captures.append(attempt)
+                        _write_capture(capture_dir, patient_uuid, captures)
+                        return {"status": "OK", "file": out, "size": len(pr.content),
+                                "route": route, "method": "presigned"}
+                    attempt["presigned_status"] = pr.status_code
+                    attempt["presigned_body_snippet"] = pr.text[:200]
+                except Exception as e:
+                    attempt["presigned_error"] = f"{type(e).__name__}: {e}"
+
+            # Try presigned lookup by documentId
+            if doc_id and not presigned:
+                look = f"{CO_BASE}/proxy/documents-v1-0-server/reports/presigned"
+                try:
+                    lr = co_session.get(look, params={"objectId": patient_uuid,
+                                                      "documentId": doc_id},
+                                        headers=co_headers, timeout=30)
+                    attempt["presigned_lookup_status"] = lr.status_code
+                    attempt["presigned_lookup_body"] = lr.text[:300]
+                    if lr.status_code == 200 and "json" in lr.headers.get("Content-Type", ""):
+                        lj = lr.json()
+                        ps = lj.get("presignedUrl") or lj.get("url")
+                        if ps:
+                            pr = co_session.get(ps, timeout=60)
+                            if pr.status_code == 200 and pr.content[:5] == b"%PDF-":
+                                out = _os.path.join(reports_dir,
+                                                    f"{patient_uuid}_sleep_trend.pdf")
+                                with open(out, "wb") as f:
+                                    f.write(pr.content)
+                                attempt["result"] = "docid_presigned_pdf"
+                                captures.append(attempt)
+                                _write_capture(capture_dir, patient_uuid, captures)
+                                return {"status": "OK", "file": out,
+                                        "size": len(pr.content),
+                                        "route": route, "method": "docid_presigned"}
+                except Exception as e:
+                    attempt["presigned_lookup_error"] = f"{type(e).__name__}: {e}"
+
+            # JSON response with no clear presigned / docId path
+            attempt["result"] = "json_no_pdf"
+            captures.append(attempt)
+            continue
+
+        # Case C: error status or unexpected content
+        attempt["body_snippet"] = r.text[:500]
+        attempt["result"] = f"http_{r.status_code}"
+        captures.append(attempt)
+
+    _write_capture(capture_dir, patient_uuid, captures)
+    return {"status": "FAIL",
+            "error": "All CO report routes exhausted — see capture file",
+            "capture_file": _os.path.join(capture_dir, "co_generate_capture.json"),
+            "attempts": len(captures),
+            "routes_tried": [c.get("url") for c in captures]}
+
+
+def _write_capture(capture_dir, patient_uuid, captures):
+    """Append this run's attempts to the cumulative co_generate_capture.json."""
+    import os as _os
+    path = _os.path.join(capture_dir, "co_generate_capture.json")
+    existing = []
+    if _os.path.exists(path):
+        try:
+            with open(path) as f:
+                existing = json.load(f)
+        except Exception:
+            existing = []
+    existing.append({"patient_uuid": patient_uuid,
+                     "ts": datetime.now(timezone.utc).isoformat(),
+                     "attempts": captures})
+    with open(path, "w") as f:
+        json.dump(existing, f, indent=2, default=str)
+
+
+# ═══════════════════════════════════════════════════
 # Session Helpers
 # ═══════════════════════════════════════════════════
 

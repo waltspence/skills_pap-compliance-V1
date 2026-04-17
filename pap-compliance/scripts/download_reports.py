@@ -19,7 +19,8 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
 from utils import (
-    parse_avail_days, is_stale, check_av_session, SESSION_DIR, REPORTS_DIR
+    parse_avail_days, is_stale, check_av_session, SESSION_DIR, REPORTS_DIR,
+    download_co_sleep_trend, co_get_equipment_serial,
 )
 from datetime import datetime
 
@@ -197,16 +198,79 @@ def main():
     with open(log_path, "w") as f:
         json.dump(existing_log + log, f, indent=2, default=str)
 
+    # ── CO Sleep Trend pass ────────────────────────────────────────────
+    # Best-effort CO downloads for patients whose CO search was DOB-verified.
+    # The POST body to documents-v1-0-server is a best guess (see utils.
+    # download_co_sleep_trend); if the server rejects it, the full response is
+    # appended to /home/claude/co_generate_capture.json so the next iteration
+    # has a narrow target. This path does NOT block AV downloads — AV is done
+    # by the time we get here.
+    co_data = load_session("co_session")
+    co_downloaded = 0
+    co_failed = 0
+    co_log = []
+    if co_data:
+        co_session = co_data["session"]
+        co_headers = co_data["headers"]
+        co_queue = []
+        for r in search_results:
+            verified_co = [p for p in r.get("co", []) if p.get("dob_verified")]
+            if verified_co:
+                best = verified_co[0]
+                co_queue.append({
+                    "name": f"{r['last']}, {r['first']}",
+                    "dob": r["dob"],
+                    "patient_uuid": best["patientId"],
+                })
+        if co_queue:
+            print(f"\nCO Sleep Trend pass: {len(co_queue)} patient(s) verified on CO")
+        for j, p in enumerate(co_queue):
+            serial, eq_info = co_get_equipment_serial(co_session, co_headers,
+                                                      p["patient_uuid"])
+            if not serial:
+                print(f"  [{j+1}/{len(co_queue)}] {p['name']} — equipment lookup failed: "
+                      f"{eq_info.get('error', 'unknown')}", flush=True)
+                co_log.append({"patient": p["name"], "patient_uuid": p["patient_uuid"],
+                               "status": "EQUIPMENT_FAIL", "detail": eq_info})
+                co_failed += 1
+                continue
+            result = download_co_sleep_trend(co_session, co_headers,
+                                             p["patient_uuid"], serial,
+                                             days=30, reports_dir=args.reports_dir)
+            co_log.append({"patient": p["name"], "patient_uuid": p["patient_uuid"],
+                           "serial": serial, "result": result})
+            status = result.get("status")
+            if status == "OK":
+                co_downloaded += 1
+                print(f"  [{j+1}/{len(co_queue)}] {p['name']} — CO Sleep Trend: OK "
+                      f"({result.get('method')}, {result.get('size', 0)} bytes)", flush=True)
+            else:
+                co_failed += 1
+                print(f"  [{j+1}/{len(co_queue)}] {p['name']} — CO Sleep Trend: {status} — "
+                      f"{result.get('error', '')} [capture: {result.get('capture_file', '')}]",
+                      flush=True)
+
+        # Append CO log to the main log file
+        with open(log_path, "w") as f:
+            json.dump(existing_log + log + co_log, f, indent=2, default=str)
+    else:
+        print("\nCO session not loaded — skipping CO Sleep Trend pass.", flush=True)
+
     pdf_count = len([f for f in os.listdir(args.reports_dir) if f.endswith(".pdf")])
     total_mb = sum(os.path.getsize(os.path.join(args.reports_dir, f))
                    for f in os.listdir(args.reports_dir) if f.endswith(".pdf")) / (1024 * 1024)
 
     print(f"\n{'=' * 50}")
     print(f"CHUNK COMPLETE: downloads {start+1}-{min(end, len(full_queue))} of {len(full_queue)}")
-    print(f"  Patients with ≥1 successful PDF: {downloaded}")
-    print(f"  Patients with failures only:     {failed}")
-    print(f"  PDFs on disk:                    {pdf_count} ({total_mb:.1f} MB)")
-    print(f"  Log:                             {log_path}")
+    print(f"  AV — patients with ≥1 successful PDF: {downloaded}")
+    print(f"  AV — patients with failures only:     {failed}")
+    if co_data:
+        print(f"  CO — Sleep Trend successes:           {co_downloaded}")
+        print(f"  CO — Sleep Trend failures:            {co_failed}")
+        if co_failed:
+            print(f"  CO capture (for debugging):           /home/claude/co_generate_capture.json")
+    print(f"  PDFs on disk:                         {pdf_count} ({total_mb:.1f} MB)")
+    print(f"  Log:                                  {log_path}")
 
 
 if __name__ == "__main__":
